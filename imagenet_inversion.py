@@ -49,15 +49,17 @@ def validate_one(input, target, model):
         return res
 
     with torch.no_grad():
-        output = model(input)
-        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+        device = next(model.parameters()).device
+        output = model(input.to(device))
+        prec1 = accuracy(output.data, target.to(device), topk=(1, ))[0]
+        # prec1, prec5 = accuracy(output.data, target.to(device), topk=(1, 5))
 
     print("Verifier accuracy: ", prec1.item())
 
 
 def run(args):
     torch.manual_seed(args.local_rank)
-    device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
 
     if args.arch_name == "resnet50v15":
         from models.resnetv15 import build_resnet
@@ -83,12 +85,13 @@ def run(args):
     net.eval()
 
     # reserved to compute test accuracy on generated images by different networks
+    verifier_device = torch.device('cuda:2' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
     net_verifier = None
     if args.verifier and args.adi_scale == 0:
         # if multiple GPUs are used then we can change code to load different verifiers to different GPUs
         if args.local_rank == 0:
             print("loading verifier: ", args.verifier_arch)
-            net_verifier = models.__dict__[args.verifier_arch](pretrained=True).to(device)
+            net_verifier = models.__dict__[args.verifier_arch](pretrained=True).to(verifier_device)
             net_verifier.eval()
 
             if use_fp16:
@@ -96,13 +99,13 @@ def run(args):
 
     if args.adi_scale != 0.0:
         student_arch = "resnet18"
-        net_verifier = models.__dict__[student_arch](pretrained=True).to(device)
+        net_verifier = models.__dict__[student_arch](pretrained=True).to(verifier_device)
         net_verifier.eval()
 
         if use_fp16:
             net_verifier, _ = amp.initialize(net_verifier, [], opt_level="O2")
 
-        net_verifier = net_verifier.to(device)
+        net_verifier = net_verifier.to(verifier_device)
         net_verifier.train()
 
         if use_fp16:
@@ -168,7 +171,8 @@ def run(args):
                                              criterion=criterion,
                                              coefficients = coefficients,
                                              network_output_function = network_output_function,
-                                             hook_for_display = hook_for_display)
+                                             hook_for_display = hook_for_display,
+                                             data_parallel=args.data_parallel)
     net_student=None
     if args.adi_scale != 0:
         net_student = net_verifier
@@ -204,6 +208,7 @@ def main():
     parser.add_argument('--l2', type=float, default=0.00001, help='l2 loss on the image')
     parser.add_argument('--main_loss_multiplier', type=float, default=1.0, help='coefficient for the main loss in optimization')
     parser.add_argument('--store_best_images', action='store_true', help='save best images as separate files')
+    parser.add_argument('--data_parallel', action='store_true', help='use data parallel')
 
     args = parser.parse_args()
     print(args)

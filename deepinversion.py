@@ -33,9 +33,12 @@ class DeepInversionFeatureHook():
     '''
     def __init__(self, module):
         self.hook = module.register_forward_hook(self.hook_fn)
+        self.r_feature = {}
 
     def hook_fn(self, module, input, output):
+        # print(f'DeepHook: input[0] {input[0].device} {input[0].shape}')
         # hook co compute deepinversion's feature distribution regularization
+        device = input[0].device
         nch = input[0].shape[1]
         mean = input[0].mean([0, 2, 3])
         var = input[0].permute(1, 0, 2, 3).contiguous().view([nch, -1]).var(1, unbiased=False)
@@ -45,10 +48,12 @@ class DeepInversionFeatureHook():
         r_feature = torch.norm(module.running_var.data - var, 2) + torch.norm(
             module.running_mean.data - mean, 2)
 
-        self.r_feature = r_feature
+        self.r_feature[device] = r_feature
+        # print(f'DeepHook: r_feature {r_feature.device} {r_feature.shape}')
         # must have no output
 
     def close(self):
+        self.r_feature.clear()
         self.hook.remove()
 
 
@@ -76,7 +81,8 @@ class DeepInversionClass(object):
                  criterion=None,
                  coefficients=dict(),
                  network_output_function=lambda x: x,
-                 hook_for_display = None):
+                 hook_for_display=None,
+                 data_parallel=False):
         '''
         :param bs: batch size per GPU for image generation
         :param use_fp16: use FP16 (or APEX AMP) for model inversion, uses less memory and is faster for GPUs with Tensor Cores
@@ -105,6 +111,7 @@ class DeepInversionClass(object):
             "adi_scale" - coefficient for Adaptive DeepInversion, competition, def =0 means no competition
         network_output_function: function to be applied to the output of the network to get the output
         hook_for_display: function to be executed at every print/save call, useful to check accuracy of verifier
+        data_parallel: if True, data parallelize net_teacher, so that we may not need fp16
         '''
 
         print("Deep inversion class generation")
@@ -135,7 +142,6 @@ class DeepInversionClass(object):
         self.jitter = jitter
         self.criterion = criterion
         self.network_output_function = network_output_function
-        do_clip = True
 
         if "r_feature" in coefficients:
             self.bn_reg_scale = coefficients["r_feature"]
@@ -175,6 +181,7 @@ class DeepInversionClass(object):
         self.hook_for_display = None
         if hook_for_display is not None:
             self.hook_for_display = hook_for_display
+        self.data_parallel = data_parallel
 
     def get_images(self, net_student=None, targets=None):
         print("get_images call")
@@ -183,10 +190,20 @@ class DeepInversionClass(object):
         use_fp16 = self.use_fp16
         save_every = self.save_every
 
-        kl_loss = nn.KLDivLoss(reduction='batchmean').cuda()
         local_rank = torch.cuda.current_device()
         best_cost = 1e4
         criterion = self.criterion
+
+        fake_model_device = torch.device('cuda:0')
+        fake_model = FakeParallelModel(net_teacher, net_student, criterion, self.network_output_function,
+                                       self.first_bn_multiplier, self.loss_r_feature_layers, self.adi_scale,
+                                       self.detach_student, self.var_scale_l1, self.var_scale_l2, self.bn_reg_scale,
+                                       self.l2_scale, self.main_loss_multiplier, save_every)
+        if self.data_parallel:
+            fake_model = nn.DataParallel(fake_model, device_ids=[0, 1]).to(fake_model_device)
+        else:
+            fake_model = fake_model.to(fake_model_device)
+        fake_model.eval()
 
         # setup target labels
         if targets is None:
@@ -270,66 +287,15 @@ class DeepInversionClass(object):
 
                 # forward pass
                 optimizer.zero_grad()
-                net_teacher.zero_grad()
+                fake_model.zero_grad()
 
-                outputs = net_teacher(inputs_jit)
-                outputs = self.network_output_function(outputs)
+                outputs, loss, loss_r_feature = fake_model(inputs_jit.to(fake_model_device), targets.to(fake_model_device), iteration)
 
-                # R_cross classification loss
-                loss = criterion(outputs, targets)
-
-                # R_prior losses
-                loss_var_l1, loss_var_l2 = get_image_prior_losses(inputs_jit)
-
-                # R_feature loss
-                rescale = [self.first_bn_multiplier] + [1. for _ in range(len(self.loss_r_feature_layers)-1)]
-                loss_r_feature = sum([mod.r_feature * rescale[idx] for (idx, mod) in enumerate(self.loss_r_feature_layers)])
-
-                # R_ADI
-                loss_verifier_cig = torch.zeros(1)
-                if self.adi_scale!=0.0:
-                    if self.detach_student:
-                        outputs_student = net_student(inputs_jit).detach()
-                    else:
-                        outputs_student = net_student(inputs_jit)
-
-                    T = 3.0
-                    if 1:
-                        T = 3.0
-                        # Jensen Shanon divergence:
-                        # another way to force KL between negative probabilities
-                        P = nn.functional.softmax(outputs_student / T, dim=1)
-                        Q = nn.functional.softmax(outputs / T, dim=1)
-                        M = 0.5 * (P + Q)
-
-                        P = torch.clamp(P, 0.01, 0.99)
-                        Q = torch.clamp(Q, 0.01, 0.99)
-                        M = torch.clamp(M, 0.01, 0.99)
-                        eps = 0.0
-                        loss_verifier_cig = 0.5 * kl_loss(torch.log(P + eps), M) + 0.5 * kl_loss(torch.log(Q + eps), M)
-                         # JS criteria - 0 means full correlation, 1 - means completely different
-                        loss_verifier_cig = 1.0 - torch.clamp(loss_verifier_cig, 0.0, 1.0)
-
-                    if local_rank==0:
-                        if iteration % save_every==0:
-                            print('loss_verifier_cig', loss_verifier_cig.item())
-
-                # l2 loss on images
-                loss_l2 = torch.norm(inputs_jit.view(self.bs, -1), dim=1).mean()
-
-                # combining losses
-                loss_aux = self.var_scale_l2 * loss_var_l2 + \
-                           self.var_scale_l1 * loss_var_l1 + \
-                           self.bn_reg_scale * loss_r_feature + \
-                           self.l2_scale * loss_l2
-
-                if self.adi_scale!=0.0:
-                    loss_aux += self.adi_scale * loss_verifier_cig
-
-                loss = self.main_loss_multiplier * loss + loss_aux
+                loss = loss.sum()
+                loss_r_feature = loss_r_feature.sum()
 
                 if local_rank==0:
-                    if iteration % save_every==0:
+                    if iteration % self.save_every==0:
                         print("------------iteration {}----------".format(iteration))
                         print("total loss", loss.item())
                         print("loss_r_feature", loss_r_feature.item())
@@ -410,3 +376,99 @@ class DeepInversionClass(object):
         net_teacher.eval()
 
         self.num_generations += 1
+
+
+class FakeParallelModel(nn.Module):
+    """ Fake model used to data parallelize the teacher model
+    """
+    def __init__(self, net_teacher, net_student, criterion, network_output_function,
+                 first_bn_multiplier, loss_r_feature_layers, adi_scale,
+                 detach_student, var_scale_l1, var_scale_l2, bn_reg_scale,
+                 l2_scale, main_loss_multiplier, save_every):
+        super().__init__()
+        self.net_teacher = net_teacher
+        self.net_student = net_student
+        self.kl_loss = nn.KLDivLoss(reduction='batchmean')
+        self.criterion = criterion
+        self.network_output_function = network_output_function
+        self.first_bn_multiplier = first_bn_multiplier
+        self.loss_r_feature_layers = loss_r_feature_layers
+        self.adi_scale = adi_scale
+        self.detach_student = detach_student
+        self.var_scale_l1 = var_scale_l1
+        self.var_scale_l2 = var_scale_l2
+        self.bn_reg_scale = bn_reg_scale
+        self.l2_scale = l2_scale
+        self.main_loss_multiplier = main_loss_multiplier
+        self.save_every = save_every
+
+    def forward(self, inputs_jit, targets, iteration):
+        # print(f'FakeParallelModel fwd: inputs_jit {inputs_jit.device} {inputs_jit.shape}')
+        # print(f'FakeParallelModel fwd: targets {targets.device} {targets.shape}')
+        device = inputs_jit.device
+        local_rank = torch.cuda.current_device()
+
+        outputs = self.net_teacher(inputs_jit)
+        outputs = self.network_output_function(outputs)
+
+        # R_cross classification loss
+        c_loss = self.criterion(outputs, targets)
+        loss = c_loss
+
+        # R_prior losses
+        loss_var_l1, loss_var_l2 = get_image_prior_losses(inputs_jit)
+        # print(f'FakeParallelModel fwd: loss_var_l1 {loss_var_l1.device} {loss_var_l1.shape}')
+        # print(f'FakeParallelModel fwd: loss_var_l2 {loss_var_l2.device} {loss_var_l2.shape}')
+
+        # R_feature loss
+        rescale = [self.first_bn_multiplier] + [1. for _ in range(len(self.loss_r_feature_layers)-1)]
+        loss_r_feature = sum([mod.r_feature[device] * rescale[idx] for (idx, mod) in enumerate(self.loss_r_feature_layers)])
+        # print(f'FakeParallelModel fwd: loss_r_feature {loss_r_feature.device} {loss_r_feature.shape}')
+
+        # R_ADI
+        loss_verifier_cig = torch.zeros(1)
+        if self.adi_scale!=0.0:
+            # print('FakeParallelModel fwd: ADI!')
+            if self.detach_student:
+                outputs_student = self.net_student(inputs_jit).detach()
+            else:
+                outputs_student = self.net_student(inputs_jit)
+
+            T = 3.0
+            if 1:
+                T = 3.0
+                # Jensen Shanon divergence:
+                # another way to force KL between negative probabilities
+                P = nn.functional.softmax(outputs_student / T, dim=1)
+                Q = nn.functional.softmax(outputs / T, dim=1)
+                M = 0.5 * (P + Q)
+
+                P = torch.clamp(P, 0.01, 0.99)
+                Q = torch.clamp(Q, 0.01, 0.99)
+                M = torch.clamp(M, 0.01, 0.99)
+                eps = 0.0
+                loss_verifier_cig = 0.5 * self.kl_loss(torch.log(P + eps), M) + 0.5 * self.kl_loss(torch.log(Q + eps), M)
+                 # JS criteria - 0 means full correlation, 1 - means completely different
+                loss_verifier_cig = 1.0 - torch.clamp(loss_verifier_cig, 0.0, 1.0)
+
+            if local_rank==0:
+                if iteration % self.save_every==0:
+                    print('loss_verifier_cig', loss_verifier_cig.item())
+
+        # l2 loss on images
+        loss_l2 = torch.norm(inputs_jit.view(inputs_jit.shape[0], -1), dim=1).mean()
+
+        # combining losses
+        loss_aux = self.var_scale_l2 * loss_var_l2 + \
+                   self.var_scale_l1 * loss_var_l1 + \
+                   self.bn_reg_scale * loss_r_feature + \
+                   self.l2_scale * loss_l2
+        # print(f'FakeParallelModel fwd: loss_aux {loss_aux.device} {loss_aux.shape}')
+
+        if self.adi_scale!=0.0:
+            loss_aux += self.adi_scale * loss_verifier_cig
+
+        loss = self.main_loss_multiplier * loss + loss_aux
+        # print(f'FakeParallelModel fwd: loss {loss.device} {loss.shape}')
+
+        return outputs, loss, loss_r_feature
